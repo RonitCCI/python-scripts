@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <db:config name="PostgreSQL_Config" doc:name="Database Config">
+        <db:generic-connection url="jdbc:postgresql://${db.host}:${db.port}/${db.name}?user=${db.user}&amp;password=${db.password}&amp;sslmode=require" driverClassName="org.postgresql.Driver" />
+    </db:config>
+
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="8081" />
+    </http:listener-config>
+
+    <http:request-config name="AWS_Bedrock_HTTP_Request" doc:name="HTTP Request configuration">
+        <http:request-connection protocol="HTTPS" host="bedrock-runtime.${aws.region}.amazonaws.com" port="443">
+            <http:authentication>
+                <http:aws-v4-authentication accessKey="${aws.accessKey}" secretKey="${aws.secretKey}" region="${aws.region}" service="bedrock" />
+            </http:authentication>
+        </http:request-connection>
+    </http:request-config>
+
+    <flow name="vector-search-four-channel-flow">
+        <http:listener doc:name="Listener" config-ref="HTTP_Listener_config" path="/search/materials"/>
+        
+        <set-variable value="#[payload.Service_Call_ID default '']" doc:name="Set Target Call ID" variableName="targetId"/>
+        <set-variable value="#[payload.Divisions default null]" doc:name="Set Division" variableName="targetDivision"/>
+
+        <ee:transform doc:name="Build 4-Channel Query Texts" target="queryTexts">
+            <ee:message />
+            <ee:variables>
+                <ee:set-variable variableName="queryTexts"><![CDATA[%dw 2.0
+output application/json
+
+fun cleanText(t) = trim(t default "") replace "\u0000" with ""
+
+var serviceDesc = cleanText(payload.Service_Description)
+var problemDesc = cleanText(payload.ProblemDesc)
+var summaryNotes = (payload.app_notes default [] map (note) -> cleanText(note.SummaryNotes)) joinBy " "
+
+var fallback = if(!isEmpty(serviceDesc)) serviceDesc else if(!isEmpty(summaryNotes)) summaryNotes else "HVAC service call"
+
+var materialCtxRaw = [serviceDesc, summaryNotes, problemDesc] filter (!isEmpty($)) joinBy " "
+var materialCtx = if(!isEmpty(materialCtxRaw)) materialCtxRaw 
+                  else ((payload.order_materials default [] map $.ITEMDESC) joinBy " ") default "HVAC service call materials"
+
+---
+[
+    { channel: "problem_description", text: if(!isEmpty(problemDesc)) problemDesc else fallback },
+    { channel: "service_description", text: if(!isEmpty(serviceDesc)) serviceDesc else fallback },
+    { channel: "summary_notes", text: if(!isEmpty(summaryNotes)) summaryNotes else fallback },
+    { channel: "material_context", text: if(!isEmpty(materialCtx)) materialCtx else fallback }
+]
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <parallel-foreach doc:name="Parallel For Each Text" collection="#[vars.queryTexts]">
+            <ee:transform doc:name="Create Bedrock Payload">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    inputText: payload.text[0 to 8191] default payload.text,
+    dimensions: 1024,
+    normalize: true
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <http:request method="POST" doc:name="Invoke Titan V2 Model" config-ref="AWS_Bedrock_HTTP_Request" path="/model/amazon.titan-embed-text-v2:0/invoke"/>
+            <ee:transform doc:name="Extract Embedding">
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    channel: vars.queryTexts[vars.counter - 1].channel,
+    vector: "[" ++ (payload.embedding joinBy ",") ++ "]"
+}]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+        </parallel-foreach>
+
+        <ee:transform doc:name="Store Vectors" target="queryVectors">
+            <ee:message />
+            <ee:variables>
+                <ee:set-variable variableName="queryVectors"><![CDATA[%dw 2.0
+output application/json
+---
+(payload map $.payload) reduce ((item, acc={}) -> acc ++ { (item.channel): item.vector })
+]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <scatter-gather doc:name="Scatter-Gather">
+            
+            <route>
+                <db:select doc:name="Search Problem Vector" config-ref="PostgreSQL_Config" target="problemResults">
+                    <db:sql><![CDATA[
+                        SELECT service_call_id, service_description, summary_notes, material_description,
+                               (1 - (problem_description_emb <=> :vec::vector)) AS similarity_score,
+                               'problem_description' as search_channel
+                        FROM service_calls
+                        WHERE material_description IS NOT NULL AND TRIM(material_description) <> '' AND status = 'Complete'
+                          AND service_call_id <> :excludeId
+                          AND (:div IS NULL OR divisions = :div)
+                        ORDER BY similarity_score DESC LIMIT 10
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ vec: vars.queryVectors.problem_description, excludeId: vars.targetId, div: vars.targetDivision }]]]></db:input-parameters>
+                </db:select>
+            </route>
+
+            <route>
+                <db:select doc:name="Search Service Vector" config-ref="PostgreSQL_Config" target="serviceResults">
+                    <db:sql><![CDATA[
+                        SELECT service_call_id, service_description, summary_notes, material_description,
+                               (1 - (service_description_emb <=> :vec::vector)) AS similarity_score,
+                               'service_description' as search_channel
+                        FROM service_calls
+                        WHERE material_description IS NOT NULL AND TRIM(material_description) <> '' AND status = 'Complete'
+                          AND service_call_id <> :excludeId
+                          AND (:div IS NULL OR divisions = :div)
+                        ORDER BY similarity_score DESC LIMIT 10
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ vec: vars.queryVectors.service_description, excludeId: vars.targetId, div: vars.targetDivision }]]]></db:input-parameters>
+                </db:select>
+            </route>
+
+            <route>
+                <db:select doc:name="Search Summary Vector" config-ref="PostgreSQL_Config" target="summaryResults">
+                    <db:sql><![CDATA[
+                        SELECT service_call_id, service_description, summary_notes, material_description,
+                               (1 - (summary_notes_emb <=> :vec::vector)) AS similarity_score,
+                               'summary_notes' as search_channel
+                        FROM service_calls
+                        WHERE material_description IS NOT NULL AND TRIM(material_description) <> '' AND status = 'Complete'
+                          AND service_call_id <> :excludeId
+                          AND (:div IS NULL OR divisions = :div)
+                        ORDER BY similarity_score DESC LIMIT 10
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ vec: vars.queryVectors.summary_notes, excludeId: vars.targetId, div: vars.targetDivision }]]]></db:input-parameters>
+                </db:select>
+            </route>
+
+            <route>
+                <db:select doc:name="Search Material Vector" config-ref="PostgreSQL_Config" target="materialResults">
+                    <db:sql><![CDATA[
+                        SELECT service_call_id, service_description, summary_notes, material_description,
+                               (1 - (material_description_emb <=> :vec::vector)) AS similarity_score,
+                               'material_description' as search_channel
+                        FROM service_calls
+                        WHERE material_description IS NOT NULL AND TRIM(material_description) <> '' AND status = 'Complete'
+                          AND service_call_id <> :excludeId
+                          AND (:div IS NULL OR divisions = :div)
+                        ORDER BY similarity_score DESC LIMIT 10
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ vec: vars.queryVectors.material_context, excludeId: vars.targetId, div: vars.targetDivision }]]]></db:input-parameters>
+                </db:select>
+            </route>
+        </scatter-gather>
+
+        <ee:transform doc:name="Aggregate and Rank Materials">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+
+var TOP_N = 5
+var weights = {
+    service_description: 0.30,
+    summary_notes: 0.30,
+    problem_description: 0.20,
+    material_description: 0.20
+}
+
+// Combine all route payloads
+var allCalls = (vars.problemResults default []) ++ 
+               (vars.serviceResults default []) ++ 
+               (vars.summaryResults default []) ++ 
+               (vars.materialResults default [])
+
+// Helper function to split materials by ';' or '|'
+fun parseMaterials(desc) = 
+    if (desc == null or upper(trim(desc)) == "NULL" or trim(desc) == "") []
+    else if (desc contains ";") (desc splitBy ";") map trim($) filter (!isEmpty($))
+    else if (desc contains "|") (desc splitBy "|") map trim($) filter (!isEmpty($))
+    else [trim(desc)]
+
+// Expand calls to individual materials, multiply by channel weight
+var flattenedMaterials = flatten(
+    allCalls map ((call) -> 
+        parseMaterials(call.material_description) map ((mat) -> {
+            material: mat,
+            weightedScore: call.similarity_score * (weights[call.search_channel] default 1.0)
+        })
+    )
+)
+
+// Group by exact material text and sum the scores
+var groupedMaterials = flattenedMaterials groupBy $.material
+var aggregatedScores = groupedMaterials mapObject ((items, mat) -> {
+    (mat): sum(items map $.weightedScore)
+})
+
+// Convert to array, sort descending, limit to TOP_N
+var rankedArray = (keysOf(aggregatedScores) map ((mat) -> {
+    similarity_score: ((aggregatedScores[mat] as Number) * 10000) roundBy 0 / 10000,
+    material_details: {
+        ITEMDESC: mat as String
+    }
+})) orderBy -$.similarity_score
+
+---
+{
+    Service_Call_ID: vars.targetId,
+    search_metadata: {
+        search_mode: "four_channel",
+        target_division: vars.targetDivision,
+        similar_calls_considered: sizeOf(allCalls),
+        total_suggestions_found: sizeOf(rankedArray),
+        channel_weights: weights,
+        hits_per_channel: {
+            problem_description: sizeOf(vars.problemResults default []),
+            service_description: sizeOf(vars.serviceResults default []),
+            summary_notes: sizeOf(vars.summaryResults default []),
+            material_description: sizeOf(vars.materialResults default [])
+        }
+    },
+    suggested_materials: rankedArray[0 to (TOP_N - 1)] default []
+}
+]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+</mule>
