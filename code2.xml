@@ -1,0 +1,787 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:batch="http://www.mulesoft.org/schema/mule/batch"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/batch http://www.mulesoft.org/schema/mule/batch/current/mule-batch.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- CONFIGURATION PROPERTIES                                             -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <configuration-properties file="application.properties" />
+
+    <!-- Database Connection (AWS Aurora PostgreSQL) -->
+    <db:config name="Aurora_Database">
+        <db:postgres-connection 
+            host="${db.host}" 
+            port="${db.port}" 
+            database="${db.name}"
+            user="${db.user}" 
+            password="${db.password}"
+            connectTimeout="10000" 
+            connectionPoolSize="10" />
+    </db:config>
+
+    <!-- HTTP Connector for Bedrock API Calls -->
+    <http:request-config name="Bedrock_Http_Config">
+        <http:request-connection 
+            host="bedrock-runtime.${aws.region}.amazonaws.com"
+            protocol="HTTPS"
+            port="443"
+            connectionIdleTimeout="30000" />
+    </http:request-config>
+
+    <!-- File Connector for JSON Input -->
+    <file:config name="File_Config">
+        <file:connection workingDir="${file.input.dir}" />
+    </file:config>
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- MAIN PIPELINE FLOW                                                   -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="HVAC-Service-Call-Pipeline-Main">
+        <!-- 
+            STEP 1: Bootstrap Schema
+            Creates all required tables and pgvector extension
+        -->
+        <flow-ref name="Bootstrap-Schema-Flow" />
+        
+        <!-- 
+            STEP 2: Seed HVAC Materials Catalog
+            - Extract unique materials from JSON
+            - Insert into hvac_materials table
+            - Generate embeddings via Bedrock (parallel processing)
+        -->
+        <flow-ref name="Seed-HVAC-Materials-Flow" />
+        
+        <!-- 
+            STEP 3: Process Service Calls
+            - For each service call in JSON
+            - Insert service call record
+            - Insert appointment notes
+            - Generate search embedding
+            - Link materials to service call
+        -->
+        <batch:job name="Process-Service-Calls-Batch">
+            <batch:process-records>
+                <batch:step name="Process-Each-Service-Call">
+                    <flow-ref name="Upsert-Service-Call-Flow" />
+                </batch:step>
+            </batch:process-records>
+        </batch:job>
+
+        <!-- 
+            STEP 4: Create IVFFlat Vector Indexes
+            Must be done AFTER all rows are inserted
+        -->
+        <flow-ref name="Create-Vector-Indexes-Flow" />
+
+        <logger level="INFO" message="Pipeline Complete: HVAC Service Call processing finished" />
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 1: BOOTSTRAP SCHEMA                                             -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Bootstrap-Schema-Flow">
+        <logger level="INFO" message="Bootstrapping schema..." />
+
+        <!-- Enable pgvector extension -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>CREATE EXTENSION IF NOT EXISTS vector</db:sql>
+        </db:execute>
+
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>CREATE EXTENSION IF NOT EXISTS "uuid-ossp"</db:sql>
+        </db:execute>
+
+        <!-- Create hvac_materials table -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE TABLE IF NOT EXISTS hvac_materials (
+                    material_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+                    itemnmbr        TEXT,
+                    itemdesc        TEXT        NOT NULL,
+                    item_category   TEXT,
+                    unit_price      NUMERIC(10, 2),
+                    usage_count     INT         NOT NULL DEFAULT 0,
+                    is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
+                    item_embedding  VECTOR(1024),
+                    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_hvac_materials_desc
+                    ON hvac_materials (LOWER(itemdesc));
+            </db:sql>
+        </db:execute>
+
+        <!-- Create service_calls_test table -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE TABLE IF NOT EXISTS service_calls_test (
+                    service_call_id     TEXT        PRIMARY KEY,
+                    service_description TEXT,
+                    problem_desc        TEXT,
+                    custnmbr            TEXT,
+                    adrscode            TEXT,
+                    division            TEXT,
+                    combined_notes      TEXT,
+                    search_embedding    VECTOR(1024),
+                    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            </db:sql>
+        </db:execute>
+
+        <!-- Create hvac_appointments_test table -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE TABLE IF NOT EXISTS hvac_appointments_test (
+                    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+                    service_call_id     TEXT        NOT NULL REFERENCES service_calls_test(service_call_id) ON DELETE CASCADE,
+                    appt_number         TEXT,
+                    office_notes        TEXT,
+                    summary_notes       TEXT,
+                    onsite_start_time   TIMESTAMPTZ,
+                    onsite_stop_time    TIMESTAMPTZ,
+                    status              TEXT,
+                    followup_reason     TEXT,
+                    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_appts_service_call_id
+                    ON hvac_appointments_test (service_call_id);
+            </db:sql>
+        </db:execute>
+
+        <!-- Create hvac_service_items_test junction table -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE TABLE IF NOT EXISTS hvac_service_items_test (
+                    id                  UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+                    service_call_id     TEXT        NOT NULL REFERENCES service_calls_test(service_call_id) ON DELETE CASCADE,
+                    material_id         UUID        NOT NULL REFERENCES hvac_materials(material_id),
+                    trxqty              NUMERIC(10, 5),
+                    billing_amount      NUMERIC(10, 5),
+                    similarity_score    FLOAT,
+                    was_recommended     BOOLEAN     NOT NULL DEFAULT FALSE,
+                    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                
+                CREATE INDEX IF NOT EXISTS idx_scm_service_call_id
+                    ON hvac_service_items_test (service_call_id);
+                CREATE INDEX IF NOT EXISTS idx_scm_material_id
+                    ON hvac_service_items_test (material_id);
+            </db:sql>
+        </db:execute>
+
+        <logger level="INFO" message="Schema bootstrap complete" />
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 2: SEED HVAC MATERIALS (with parallel embedding)               -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Seed-HVAC-Materials-Flow">
+        <logger level="INFO" message="Loading JSON and extracting unique materials..." />
+
+        <!-- Read JSON file -->
+        <file:read config-ref="File_Config" path="${file.input.name}" />
+
+        <!-- Parse JSON into records -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        payload
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Extract unique materials from all records -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        import * from dw::core::Arrays
+                        
+                        var records = payload
+                        var allMaterials = records flatMap (r -> r.order_materials default [])
+                        var uniqueMaterials = allMaterials 
+                            groupBy (m -> lower(m.ITEMDESC default ""))
+                            mapValues (group -> group[0])
+                            mapValues (m -> {
+                                itemnmbr: m.ITEMNMBR,
+                                itemdesc: m.ITEMDESC,
+                                item_category: m.ItemCategory
+                            })
+                        
+                        {
+                            materials: uniqueMaterials,
+                            recordCount: sizeOf(records),
+                            uniqueCount: sizeOf(uniqueMaterials)
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="INFO" message="#['Found ' ++ payload.uniqueCount ++ ' unique materials']" />
+
+        <!-- Store original records in flow variable for later processing -->
+        <set-variable variableName="serviceRecords" value="#[payload]" />
+
+        <!-- Step 1: Check existing materials in database -->
+        <db:select config-ref="Aurora_Database">
+            <db:sql>
+                SELECT material_id, LOWER(itemdesc) as key, item_embedding IS NOT NULL AS has_embedding
+                FROM hvac_materials
+            </db:sql>
+        </db:select>
+
+        <!-- Transform to catalog map (key -> material_id) -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        
+                        var existingMaterials = payload
+                        var catalogMap = existingMaterials reduce (m, acc -> acc + {(m.key): m.material_id})
+                        var materialsData = vars.serviceRecords.materials
+                        
+                        {
+                            catalogMap: catalogMap,
+                            materials: materialsData,
+                            materialsToInsert: materialsData 
+                                filterValues (m -> !(m.itemdesc lower in catalogMap))
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="catalogData" value="#[payload]" />
+
+        <!-- Step 2: Batch insert new materials -->
+        <choice>
+            <when expression="#[sizeOf(vars.catalogData.materialsToInsert) > 0]">
+                <logger level="INFO" 
+                    message="#['Batch inserting ' ++ sizeOf(vars.catalogData.materialsToInsert) ++ ' new materials']" />
+                
+                <batch:job name="Insert-New-Materials-Batch">
+                    <batch:process-records>
+                        <batch:step name="Insert-Material-Row">
+                            <db:insert config-ref="Aurora_Database" bulkMode="true">
+                                <db:sql>
+                                    INSERT INTO hvac_materials (itemnmbr, itemdesc, item_category)
+                                    VALUES (:itemnmbr, :itemdesc, :item_category)
+                                    ON CONFLICT (LOWER(itemdesc)) DO UPDATE
+                                    SET updated_at = NOW()
+                                </db:sql>
+                                <db:input-parameters>
+                                    <![CDATA[
+                                        {
+                                            itemnmbr: payload.itemnmbr,
+                                            itemdesc: payload.itemdesc,
+                                            item_category: payload.item_category
+                                        }
+                                    ]]>
+                                </db:input-parameters>
+                            </db:insert>
+                        </batch:step>
+                    </batch:process-records>
+                </batch:job>
+            </when>
+            <otherwise>
+                <logger level="INFO" message="No new materials to insert - all exist in database" />
+            </otherwise>
+        </choice>
+
+        <!-- Step 3: Get all materials (new + existing) with IDs -->
+        <db:select config-ref="Aurora_Database">
+            <db:sql>
+                SELECT material_id, LOWER(itemdesc) as key, item_embedding IS NOT NULL AS has_embedding
+                FROM hvac_materials
+            </db:sql>
+        </db:select>
+
+        <!-- Step 4: Prepare materials needing embeddings -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        
+                        var materialsInDB = payload
+                        var originalMaterials = vars.catalogData.materials
+                        
+                        {
+                            materialsForEmbedding: materialsInDB 
+                                filter (m -> !(m.has_embedding))
+                                map (m -> {
+                                    material_id: m.material_id,
+                                    key: m.key,
+                                    embed_text: (originalMaterials[m.key].itemnmbr default "") ++ " " ++ 
+                                                (originalMaterials[m.key].itemdesc default "") ++ " " ++ 
+                                                (originalMaterials[m.key].item_category default "")
+                                })
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="embeddingsNeeded" value="#[payload]" />
+
+        <logger level="INFO" 
+            message="#['Generating embeddings for ' ++ sizeOf(vars.embeddingsNeeded.materialsForEmbedding) ++ ' materials (parallel)']" />
+
+        <!-- Step 5: Parallel embedding generation via Bedrock -->
+        <batch:job name="Generate-Material-Embeddings-Batch">
+            <batch:process-records>
+                <batch:step name="Call-Bedrock-For-Embedding">
+                    <!-- Call Bedrock API to generate embedding -->
+                    <flow-ref name="Generate-Bedrock-Embedding" />
+                </batch:step>
+            </batch:process-records>
+        </batch:job>
+
+        <!-- Step 6: Batch update embeddings in database -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        var embeddingResults = vars.embeddingResults default []
+                        embeddingResults
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <batch:job name="Update-Material-Embeddings-Batch">
+            <batch:process-records>
+                <batch:step name="Update-Embedding-Row">
+                    <db:update config-ref="Aurora_Database" bulkMode="true">
+                        <db:sql>
+                            UPDATE hvac_materials
+                            SET item_embedding = :embedding::vector,
+                                updated_at = NOW()
+                            WHERE material_id = :material_id
+                        </db:sql>
+                        <db:input-parameters>
+                            <![CDATA[
+                                {
+                                    material_id: payload.material_id,
+                                    embedding: payload.embedding
+                                }
+                            ]]>
+                        </db:input-parameters>
+                    </db:update>
+                </batch:step>
+            </batch:process-records>
+        </batch:job>
+
+        <logger level="INFO" message="HVAC materials catalog seeded successfully" />
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 3: GENERATE BEDROCK EMBEDDING (sub-flow for parallel calls)    -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Generate-Bedrock-Embedding">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        {
+                            inputText: payload.embed_text,
+                            dimensions: 1024,
+                            normalize: true
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Call Bedrock Invoke Model API -->
+        <http:request config-ref="Bedrock_Http_Config"
+            method="POST"
+            path="/model/${bedrock.model.id}/invoke"
+            doc:name="Call Bedrock Embedding API">
+            <http:headers>
+                <![CDATA[
+                    {
+                        "Content-Type": "application/json",
+                        "Authorization": "AWS4-HMAC-SHA256 Credential=..."
+                    }
+                ]]>
+            </http:headers>
+        </http:request>
+
+        <!-- Parse embedding response -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        {
+                            material_id: vars.currentMaterial.material_id,
+                            embedding: payload.embedding
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 4: UPSERT SERVICE CALL (main processing flow)                  -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Upsert-Service-Call-Flow">
+        <logger level="INFO" message="#['Processing service call: ' ++ payload.Service_Call_ID]" />
+
+        <!-- Check if service call already has embedding -->
+        <db:select config-ref="Aurora_Database">
+            <db:sql>
+                SELECT search_embedding IS NOT NULL as has_embedding
+                FROM service_calls_test
+                WHERE service_call_id = :service_call_id
+            </db:sql>
+            <db:input-parameters>
+                <![CDATA[
+                    {
+                        service_call_id: payload.Service_Call_ID
+                    }
+                ]]>
+            </db:input-parameters>
+        </db:select>
+
+        <choice>
+            <when expression="#[payload[0].has_embedding default false]">
+                <logger level="INFO" message="#['SKIP: Service call ' ++ vars.currentRecord.Service_Call_ID ++ ' already embedded']" />
+            </when>
+            <otherwise>
+                <!-- Step 1: Build combined notes -->
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[
+                                %dw 2.0
+                                var notes = payload.app_notes default []
+                                var combinedNotes = (notes map (n -> n.SummaryNotes default "") 
+                                    filter (s -> s != "")) joinBy " "
+                                
+                                {
+                                    serviceCallId: payload.Service_Call_ID,
+                                    serviceDescription: payload.Service_Description,
+                                    problemDesc: payload.ProblemDesc,
+                                    custnmbr: payload.CUSTNMBR,
+                                    adrscode: payload.ADRSCODE,
+                                    division: payload.Divisions,
+                                    combinedNotes: combinedNotes,
+                                    appNotes: payload.app_notes default []
+                                }
+                            ]]>
+                            </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+
+                <set-variable variableName="serviceCallData" value="#[payload]" />
+
+                <!-- Step 2: Upsert service call record -->
+                <db:insert config-ref="Aurora_Database">
+                    <db:sql>
+                        INSERT INTO service_calls_test
+                            (service_call_id, service_description, problem_desc, 
+                             custnmbr, adrscode, division, combined_notes)
+                        VALUES (:service_call_id, :service_description, :problem_desc, 
+                                :custnmbr, :adrscode, :division, :combined_notes)
+                        ON CONFLICT (service_call_id) DO UPDATE
+                            SET service_description = EXCLUDED.service_description,
+                                problem_desc = EXCLUDED.problem_desc,
+                                custnmbr = EXCLUDED.custnmbr,
+                                adrscode = EXCLUDED.adrscode,
+                                division = EXCLUDED.division,
+                                combined_notes = EXCLUDED.combined_notes,
+                                updated_at = NOW()
+                    </db:sql>
+                    <db:input-parameters>
+                        <![CDATA[
+                            {
+                                service_call_id: vars.serviceCallData.serviceCallId,
+                                service_description: vars.serviceCallData.serviceDescription,
+                                problem_desc: vars.serviceCallData.problemDesc,
+                                custnmbr: vars.serviceCallData.custnmbr,
+                                adrscode: vars.serviceCallData.adrscode,
+                                division: vars.serviceCallData.division,
+                                combined_notes: vars.serviceCallData.combinedNotes
+                            }
+                        ]]>
+                    </db:input-parameters>
+                </db:insert>
+
+                <!-- Step 3: Delete and re-insert appointment notes -->
+                <db:delete config-ref="Aurora_Database">
+                    <db:sql>
+                        DELETE FROM hvac_appointments_test 
+                        WHERE service_call_id = :service_call_id
+                    </db:sql>
+                    <db:input-parameters>
+                        <![CDATA[
+                            {
+                                service_call_id: vars.serviceCallData.serviceCallId
+                            }
+                        ]]>
+                    </db:input-parameters>
+                </db:delete>
+
+                <!-- Batch insert appointment notes -->
+                <batch:job name="Insert-Appointments-Batch">
+                    <batch:process-records>
+                        <batch:step name="Insert-Appointment">
+                            <db:insert config-ref="Aurora_Database" bulkMode="true">
+                                <db:sql>
+                                    INSERT INTO hvac_appointments_test
+                                        (service_call_id, appt_number, office_notes, summary_notes,
+                                         onsite_start_time, onsite_stop_time, status, followup_reason)
+                                    VALUES (:service_call_id, :appt_number, :office_notes, :summary_notes,
+                                            :onsite_start_time, :onsite_stop_time, :status, :followup_reason)
+                                </db:sql>
+                                <db:input-parameters>
+                                    <![CDATA[
+                                        {
+                                            service_call_id: vars.serviceCallData.serviceCallId,
+                                            appt_number: payload.ApptNumber,
+                                            office_notes: payload.OfficeNotes,
+                                            summary_notes: payload.SummaryNotes,
+                                            onsite_start_time: payload.OnsiteStartTime,
+                                            onsite_stop_time: payload.OnsiteStopTime,
+                                            status: payload.Status,
+                                            followup_reason: payload.FollowupReason
+                                        }
+                                    ]]>
+                                </db:input-parameters>
+                            </db:insert>
+                        </batch:step>
+                    </batch:process-records>
+                </batch:job>
+
+                <!-- Step 4: Generate search embedding for service call -->
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload>
+                            <![CDATA[
+                                %dw 2.0
+                                (vars.serviceCallData.serviceDescription default "") ++ " " ++ 
+                                (vars.serviceCallData.combinedNotes default "")
+                            ]]>
+                            </ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+
+                <!-- Call Bedrock to generate search embedding -->
+                <flow-ref name="Generate-Service-Call-Embedding" />
+
+                <!-- Step 5: Link materials to service call -->
+                <flow-ref name="Link-Materials-To-Service-Call" />
+            </otherwise>
+        </choice>
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 5: GENERATE SERVICE CALL EMBEDDING                             -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Generate-Service-Call-Embedding">
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        {
+                            inputText: payload,
+                            dimensions: 1024,
+                            normalize: true
+                        }
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <!-- Call Bedrock API -->
+        <http:request config-ref="Bedrock_Http_Config"
+            method="POST"
+            path="/model/${bedrock.model.id}/invoke">
+            <http:headers>
+                <![CDATA[
+                    {
+                        "Content-Type": "application/json"
+                    }
+                ]]>
+            </http:headers>
+        </http:request>
+
+        <!-- Update service call with embedding -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload>
+                    <![CDATA[
+                        %dw 2.0
+                        payload.embedding joinBy ","
+                    ]]>
+                </ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <db:update config-ref="Aurora_Database">
+            <db:sql>
+                UPDATE service_calls_test
+                SET search_embedding = :embedding::vector,
+                    updated_at = NOW()
+                WHERE service_call_id = :service_call_id
+            </db:sql>
+            <db:input-parameters>
+                <![CDATA[
+                    {
+                        service_call_id: vars.serviceCallData.serviceCallId,
+                        embedding: '[' ++ payload ++ ']'
+                    }
+                ]]>
+            </db:input-parameters>
+        </db:update>
+
+        <logger level="INFO" message="#['Embedded service call: ' ++ vars.serviceCallData.serviceCallId]" />
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 6: LINK MATERIALS TO SERVICE CALL                              -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Link-Materials-To-Service-Call">
+        <!-- Delete existing non-recommended items -->
+        <db:delete config-ref="Aurora_Database">
+            <db:sql>
+                DELETE FROM hvac_service_items_test 
+                WHERE service_call_id = :service_call_id AND was_recommended = FALSE
+            </db:sql>
+            <db:input-parameters>
+                <![CDATA[
+                    {
+                        service_call_id: vars.serviceCallData.serviceCallId
+                    }
+                ]]>
+            </db:input-parameters>
+        </db:delete>
+
+        <!-- Get catalog map for lookup -->
+        <db:select config-ref="Aurora_Database">
+            <db:sql>
+                SELECT material_id, LOWER(itemdesc) as key
+                FROM hvac_materials
+            </db:sql>
+        </db:select>
+
+        <set-variable variableName="catalogMapForLinking" value="#[payload]" />
+
+        <!-- Batch insert material links -->
+        <batch:job name="Insert-Material-Links-Batch">
+            <batch:process-records>
+                <batch:step name="Insert-Material-Link">
+                    <db:insert config-ref="Aurora_Database" bulkMode="true">
+                        <db:sql>
+                            INSERT INTO hvac_service_items_test
+                                (service_call_id, material_id, trxqty, billing_amount, was_recommended)
+                            VALUES (:service_call_id, :material_id, :trxqty, :billing_amount, FALSE)
+                        </db:sql>
+                        <db:input-parameters>
+                            <![CDATA[
+                                {
+                                    service_call_id: vars.serviceCallData.serviceCallId,
+                                    material_id: payload.material_id,
+                                    trxqty: payload.TRXQTY default 0,
+                                    billing_amount: payload.Billing_Amount default 0
+                                }
+                            ]]>
+                        </db:input-parameters>
+                    </db:insert>
+                </batch:step>
+            </batch:process-records>
+        </batch:job>
+
+        <!-- Batch increment usage_count -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                UPDATE hvac_materials 
+                SET usage_count = usage_count + 1, updated_at = NOW()
+                WHERE material_id IN (
+                    SELECT DISTINCT material_id 
+                    FROM hvac_service_items_test 
+                    WHERE service_call_id = :service_call_id
+                )
+            </db:sql>
+            <db:input-parameters>
+                <![CDATA[
+                    {
+                        service_call_id: vars.serviceCallData.serviceCallId
+                    }
+                ]]>
+            </db:input-parameters>
+        </db:execute>
+    </flow>
+
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- FLOW 7: CREATE VECTOR INDEXES                                       -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+
+    <flow name="Create-Vector-Indexes-Flow">
+        <logger level="INFO" message="Creating IVFFlat vector indexes..." />
+
+        <!-- Create index on hvac_materials item_embedding -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE INDEX IF NOT EXISTS idx_hvac_materials_ivfflat
+                ON hvac_materials
+                USING ivfflat (item_embedding vector_cosine_ops)
+                WITH (lists = 100)
+            </db:sql>
+        </db:execute>
+
+        <!-- Create index on service_calls_test search_embedding -->
+        <db:execute config-ref="Aurora_Database">
+            <db:sql>
+                CREATE INDEX IF NOT EXISTS idx_service_calls_test_ivfflat
+                ON service_calls_test
+                USING ivfflat (search_embedding vector_cosine_ops)
+                WITH (lists = 100)
+            </db:sql>
+        </db:execute>
+
+        <logger level="INFO" message="Vector indexes created successfully" />
+    </flow>
+
+</mule>
