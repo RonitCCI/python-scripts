@@ -1,516 +1,638 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+<mule xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns:db="http://www.mulesoft.org/schema/mule/db"
       xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
-      xmlns:validation="http://www.mulesoft.org/schema/mule/validation"
-      xsi:schemaLocation="
-        http://www.mulesoft.org/schema/mule/core
-            http://www.mulesoft.org/schema/mule/core/current/mule.xsd
-        http://www.mulesoft.org/schema/mule/http
-            http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
-        http://www.mulesoft.org/schema/mule/db
-            http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
-        http://www.mulesoft.org/schema/mule/ee/core
-            http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
-        http://www.mulesoft.org/schema/mule/validation
-            http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls" xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd 
+http://www.mulesoft.org/schema/mule/tls http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd 
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
+        http://www.mulesoft.org/schema/mule/core      https://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http      https://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db        https://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core   https://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/tls       https://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd">
 
     <!-- ═══════════════════════════════════════════════════════════════
-         GLOBAL CONFIGURATION
-    ═══════════════════════════════════════════════════════════════════ -->
+         GLOBAL CONFIGURATIONS
+         ═══════════════════════════════════════════════════════════════ -->
 
-    <!-- HTTP Listener (exposes POST /api/recommendations) -->
-    <http:listener-config name="HTTP_Listener_Config" doc:name="HTTP Listener Config">
-        <http:listener-connection host="0.0.0.0" port="${http.port}"/>
-    </http:listener-config>
-
-    <!-- PostgreSQL / Aurora (pgvector) data source -->
+    <!-- PostgreSQL (RDS) Connection Pool -->
     <db:config name="PostgreSQL_Config" doc:name="PostgreSQL Config">
-        <db:generic-connection
-            url="jdbc:postgresql://${db.host}:${db.port}/${db.name}?sslmode=require&amp;connectTimeout=10"
+        <db:jdbc-connection
+            url="jdbc:postgresql://dynaplutus.cluster-c2d4scu2oia3.us-east-1.rds.amazonaws.com:5432/postgres?sslmode=require&amp;connectTimeout=10"
             driverClassName="org.postgresql.Driver"
             user="${db.user}"
-            password="${db.password}"/>
+            password="${db.password}">
+            <db:connection-properties>
+                <db:connection-property key="tcpKeepAlive" value="true"/>
+            </db:connection-properties>
+        </db:jdbc-connection>
     </db:config>
 
-    <!-- ═══════════════════════════════════════════════════════════════
-         MAIN FLOW  –  POST /api/recommendations
-    ═══════════════════════════════════════════════════════════════════ -->
-    <flow name="material-recommendation-main-flow" doc:name="Material Recommendation Main Flow">
+    <!-- AWS Bedrock HTTP Connection (Titan Embeddings V2) -->
+    <http:request-config name="Bedrock_Request_Config" doc:name="Bedrock Request Config">
+        <http:request-connection
+            protocol="HTTPS"
+            host="bedrock-runtime.us-east-1.amazonaws.com"
+            port="443">
+            <tls:context>
+                <tls:trust-store insecure="false"/>
+            </tls:context>
+        </http:request-connection>
+    </http:request-config>
 
-        <!-- ── 1. HTTP Listener ──────────────────────────────────── -->
+    <!-- Inbound HTTP Listener -->
+    <http:listener-config name="HTTP_Listener_Config" doc:name="HTTP Listener Config">
+        <http:listener-connection host="0.0.0.0" port="${api.port:8080}"/>
+    </http:listener-config>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         FLOW 1 — POST /api/v1/recommend-materials  (Main Flow)
+         ═══════════════════════════════════════════════════════════════ -->
+    <flow name="recommend-materials-flow" doc:name="Recommend Materials Flow">
+
         <http:listener
             config-ref="HTTP_Listener_Config"
-            path="/api/recommendations"
+            path="/api/v1/recommend-materials"
             allowedMethods="POST"
-            doc:name="POST /api/recommendations"/>
+            doc:name="POST /api/v1/recommend-materials"/>
 
-        <!-- Record start time for latency tracking -->
-        <set-variable
-            variableName="startTimeMs"
-            value="#[now() as Number {unit: 'milliseconds'}]"
-            doc:name="Record Start Time"/>
+        <!-- Record start time for latency calculation -->
+        <set-variable variableName="startTimeMs"
+                      value="#[now() as Number {unit: 'milliseconds'}]"
+                      doc:name="Record Start Time"/>
 
-        <!-- ── 2. Parse & Validate Request ───────────────────────── -->
-        <ee:transform doc:name="Parse and Normalise Request Body">
+        <!-- ── Input validation ──────────────────────────────────── -->
+        <ee:transform doc:name="Parse and Validate Request Body">
             <ee:message>
                 <ee:set-payload><![CDATA[%dw 2.0
 output application/java
-var req = if (payload.Request != null) payload.Request else payload
 ---
-{
-    serviceCallId:      req.Service_Call_ID default req.service_call_id,
-    serviceDescription: req.Service_Description default "",
-    problemDesc:        req.ProblemDesc default "",
-    custnmbr:           req.CUSTNMBR default "",
-    adrscode:           req.ADRSCODE default "",
-    divisions:          req.Divisions default "",
-
-    // Collect all non-null SummaryNotes into a single string
-    summaryNotes: (req.app_notes default [])
-        filter ($.SummaryNotes != null and $.SummaryNotes != "\u0000" and $.SummaryNotes != "")
-        map $.SummaryNotes
-        joinBy " ",
-
-    // Existing material descriptions (lower-cased for dedup)
-    existingDescs: (req.order_materials default [])
-        filter ($.ITEMDESC != null)
-        map lower($.ITEMDESC trim),
-
-    // Keep originals for reference
-    appNotes:       req.app_notes default [],
-    orderMaterials: req.order_materials default []
-}]]></ee:set-payload>
+payload]]></ee:set-payload>
             </ee:message>
         </ee:transform>
 
-        <!-- Validate Service_Call_ID is present -->
-        <validation:is-not-null
-            value="#[payload.serviceCallId]"
-            message="Request must contain 'Service_Call_ID'"
-            doc:name="Validate Service_Call_ID"/>
-
-        <!-- Stash the parsed request as a flow variable -->
-        <set-variable
-            variableName="parsedRequest"
-            value="#[payload]"
-            doc:name="Store Parsed Request"/>
-
-        <!-- ── 3. Fetch Embedding from DB ─────────────────────────── -->
-        <db:select config-ref="PostgreSQL_Config" doc:name="Fetch Embedding for Service Call">
-            <db:sql>
-                SELECT search_embedding::text AS embedding_text
-                FROM   service_calls_test
-                WHERE  service_call_id = :serviceCallId
-            </db:sql>
-            <db:input-parameters><![CDATA[#[{ serviceCallId: vars.parsedRequest.serviceCallId }]]]></db:input-parameters>
-        </db:select>
-
-        <set-variable
-            variableName="embedding"
-            value="#[if (!isEmpty(payload)) payload[0].embedding_text else null]"
-            doc:name="Store Embedding (null if not found)"/>
-
-        <!-- ── 4. Vector Similarity Search (skip if no embedding) ─── -->
-        <choice doc:name="Has Embedding?">
-            <when expression="#[vars.embedding != null]">
-                <db:select config-ref="PostgreSQL_Config" doc:name="Find Top-K Similar Calls">
-                    <db:sql>
-                        SELECT service_call_id
-                        FROM   service_calls_test
-                        WHERE  service_call_id  != :serviceCallId
-                          AND  search_embedding IS NOT NULL
-                        ORDER  BY search_embedding &lt;=&gt; :embedding ::vector
-                        LIMIT  :topK
-                    </db:sql>
-                    <db:input-parameters><![CDATA[#[{
-                        serviceCallId: vars.parsedRequest.serviceCallId,
-                        embedding:     vars.embedding,
-                        topK:          p('recommendation.topKSimilarCalls') as Number default 10
-                    }]]]></db:input-parameters>
-                </db:select>
-                <set-variable
-                    variableName="similarCallIds"
-                    value="#[payload map $.service_call_id]"
-                    doc:name="Store Similar Call IDs"/>
+        <choice doc:name="Validate JSON Body">
+            <when expression="#[payload == null or payload.Request == null]">
+                <set-payload value='#[output application/json --- {"error": "Body must contain a top-level Request object"}]'
+                             doc:name="Error: Missing Request"/>
+                <logger level="WARN" message="Rejected request — missing Request object" doc:name="Log 400"/>
+                <raise-error type="APP:VALIDATION" description="Missing Request object"/>
             </when>
-            <otherwise>
-                <!-- No embedding – fall back to keyword-only mode -->
-                <set-variable
-                    variableName="similarCallIds"
-                    value="#[[]]"
-                    doc:name="No Embedding – Empty Similar IDs"/>
-            </otherwise>
+            <when expression="#[payload.Request.Service_Call_ID == null or payload.Request.Service_Call_ID == '']">
+                <set-payload value='#[output application/json --- {"error": "Request.Service_Call_ID is required"}]'
+                             doc:name="Error: Missing Service_Call_ID"/>
+                <logger level="WARN" message="Rejected request — missing Service_Call_ID" doc:name="Log 400 SCI"/>
+                <raise-error type="APP:VALIDATION" description="Missing Service_Call_ID"/>
+            </when>
         </choice>
 
-        <!-- ── 5. Material Frequency from Similar Calls ──────────── -->
-        <choice doc:name="Similar Calls Found?">
-            <when expression="#[!isEmpty(vars.similarCallIds)]">
-                <db:select config-ref="PostgreSQL_Config" doc:name="Get Material Frequencies">
-                    <db:sql>
-                        SELECT m.material_id::text   AS material_id,
-                               m.itemnmbr,
-                               m.itemdesc,
-                               m.item_category        AS category,
-                               m.usage_count          AS catalog_usage,
-                               COUNT(*)               AS usage_freq
-                        FROM   hvac_service_items_test i
-                        JOIN   hvac_materials m ON i.material_id = m.material_id
-                        WHERE  i.service_call_id = ANY(ARRAY[ :ids ]::text[])
-                        GROUP  BY m.material_id, m.itemnmbr, m.itemdesc,
-                                  m.item_category, m.usage_count
-                        ORDER  BY usage_freq DESC
-                    </db:sql>
-                    <db:input-parameters><![CDATA[#[{ ids: vars.similarCallIds }]]]></db:input-parameters>
-                </db:select>
-                <set-variable
-                    variableName="freqResults"
-                    value="#[payload]"
-                    doc:name="Store Frequency Results"/>
-            </when>
-            <otherwise>
-                <set-variable
-                    variableName="freqResults"
-                    value="#[[]]"
-                    doc:name="No Similar Calls – Empty Freq Results"/>
-            </otherwise>
-        </choice>
-
-        <!-- ── 6. Keyword Extraction ──────────────────────────────── -->
-        <!-- Combine all text fields, lower-case, extract words ≥ 3 chars,
-             strip stop-words, deduplicate, take first 10               -->
-        <ee:transform doc:name="Extract Keywords from Request Text">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/java
-var combinedText = lower(
-    vars.parsedRequest.serviceDescription ++ " " ++
-    vars.parsedRequest.problemDesc        ++ " " ++
-    vars.parsedRequest.summaryNotes
-)
-var stopWords = ["the","was","and","for","with","that","this","from",
-                 "been","have","has","had","were","are","not","will",
-                 "our","all","they","their","also","more","upon"]
-var allWords  = (combinedText scan /\b\w{3,}\b/) map $[0]
-var filtered  = allWords filter !(stopWords contains $)
-// deduplicate while preserving order
-var deduped   = filtered reduce ((word, acc = []) ->
-    if (acc contains word) acc else acc + [word])
----
-deduped[0..9]   // top 10 keywords]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-
-        <set-variable
-            variableName="keywords"
-            value="#[payload]"
-            doc:name="Store Keywords"/>
-
-        <!-- ── 7. Keyword Search Against Material Catalog ─────────── -->
-        <!-- Run one query with all keyword patterns via ILIKE + OR     -->
-        <choice doc:name="Keywords Found?">
-            <when expression="#[!isEmpty(vars.keywords)]">
-                <db:select config-ref="PostgreSQL_Config" doc:name="Keyword Search in hvac_materials">
-                    <db:sql>
-                        SELECT material_id::text AS material_id,
-                               itemnmbr,
-                               itemdesc,
-                               item_category      AS category,
-                               usage_count        AS catalog_usage
-                        FROM   hvac_materials
-                        WHERE  itemdesc     ILIKE ANY(ARRAY[ :patterns ]::text[])
-                           OR  item_category ILIKE ANY(ARRAY[ :patterns ]::text[])
-                        LIMIT  200
-                    </db:sql>
-                    <!-- Build "%keyword%" patterns from the keyword list -->
-                    <db:input-parameters><![CDATA[#[{
-                        patterns: vars.keywords map ("%" ++ $ ++ "%")
-                    }]]]></db:input-parameters>
-                </db:select>
-
-                <!-- Enrich each match with how many keywords it hit -->
-                <ee:transform doc:name="Score Keyword Matches">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
-output application/java
-var rows     = payload
-var keywords = vars.keywords
----
-rows map (row) -> do {
-    var matched = keywords filter (
-        (lower(row.itemdesc default "")    contains $) or
-        (lower(row.category  default "")    contains $)
-    )
-    ---
-    {
-        material_id:      row.material_id,
-        itemnmbr:         row.itemnmbr,
-        itemdesc:         row.itemdesc,
-        category:         row.category,
-        catalog_usage:    row.catalog_usage,
-        matched_keywords: matched,
-        // 0.5 for first match + 0.2 per additional match
-        keyword_score:    if (sizeOf(matched) == 0) 0.0
-                          else 0.5 + ((sizeOf(matched) - 1) * 0.2)
-    }
-}]]></ee:set-payload>
-                    </ee:message>
-                </ee:transform>
-
-                <set-variable
-                    variableName="kwResults"
-                    value="#[payload]"
-                    doc:name="Store Keyword Results"/>
-            </when>
-            <otherwise>
-                <set-variable
-                    variableName="kwResults"
-                    value="#[[]]"
-                    doc:name="No Keywords – Empty KW Results"/>
-            </otherwise>
-        </choice>
-
-        <!-- ── 8. Fetch Existing Material IDs from DB ─────────────── -->
-        <db:select config-ref="PostgreSQL_Config" doc:name="Get Existing Material IDs for Call">
-            <db:sql>
-                SELECT material_id::text AS material_id
-                FROM   hvac_service_items_test
-                WHERE  service_call_id = :serviceCallId
-            </db:sql>
-            <db:input-parameters><![CDATA[#[{ serviceCallId: vars.parsedRequest.serviceCallId }]]]></db:input-parameters>
-        </db:select>
-
-        <set-variable
-            variableName="existingMaterialIds"
-            value="#[payload map $.material_id]"
-            doc:name="Store Existing Material IDs"/>
-
-        <!-- ── 9. Fetch Max Catalog Usage for Normalisation ──────── -->
-        <db:select config-ref="PostgreSQL_Config" doc:name="Get Max Catalog Usage Count">
-            <db:sql>SELECT MAX(usage_count) AS max_usage FROM hvac_materials</db:sql>
-        </db:select>
-
-        <set-variable
-            variableName="maxUsage"
-            value="#[if (payload[0].max_usage != null and payload[0].max_usage != 0) payload[0].max_usage else 1]"
-            doc:name="Store Max Usage"/>
-
-        <!-- ── 10. Merge, Deduplicate, Score & Rank ───────────────── -->
-        <ee:transform doc:name="Merge and Score All Candidates">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/java
-
-// ── Weights (mirrors Python constants) ─────────────────────────
-var FREQ_W       = 0.4
-var KW_W         = 0.3
-var POP_W        = 0.2
-
-var numSimilar   = sizeOf(vars.similarCallIds)
-var maxUsage     = vars.maxUsage as Number
-var existingIds  = vars.existingMaterialIds
-var existingDesc = vars.parsedRequest.existingDescs   // already lower-cased
-
-// ── Helper: should we skip this material? ──────────────────────
-fun isExcluded(mid, desc) =
-    (existingIds  contains mid) or
-    (existingDesc contains lower(desc default "" trim))
-
-// ── Build candidate map from frequency results ─────────────────
-var freqCandidates = vars.freqResults
-    filter !isExcluded($.material_id, $.itemdesc)
-    map (row) -> {
-        material_id:   row.material_id,
-        itemnmbr:      row.itemnmbr,
-        itemdesc:      row.itemdesc,
-        category:      row.category,
-        catalog_usage: row.catalog_usage,
-        freq_score:    (row.usage_freq as Number) / (if (numSimilar > 0) numSimilar else 1),
-        pop_score:     (row.catalog_usage as Number) / maxUsage,
-        kw_score:      0.0,
-        matched_kw:    [],
-        freq_count:    row.usage_freq as Number
-    }
-
-// ── Index freq candidates by material_id ──────────────────────
-var freqById = freqCandidates groupBy $.material_id
-
-// ── Merge keyword results ──────────────────────────────────────
-var kwEnriched = vars.kwResults
-    filter !isExcluded($.material_id, $.itemdesc)
-    map (kw) -> do {
-        var existing = freqById[kw.material_id]
-        ---
-        if (existing != null) do {
-            var base = existing[0]
-            ---
-            {
-                material_id:   base.material_id,
-                itemnmbr:      base.itemnmbr,
-                itemdesc:      base.itemdesc,
-                category:      base.category,
-                catalog_usage: base.catalog_usage,
-                freq_score:    base.freq_score,
-                pop_score:     base.pop_score,
-                kw_score:      kw.keyword_score as Number,
-                matched_kw:    kw.matched_keywords,
-                freq_count:    base.freq_count,
-                _merged:       true
-            }
-        }
-        else {
-            material_id:   kw.material_id,
-            itemnmbr:      kw.itemnmbr,
-            itemdesc:      kw.itemdesc,
-            category:      kw.category,
-            catalog_usage: kw.catalog_usage,
-            freq_score:    0.0,
-            pop_score:     (kw.catalog_usage as Number) / maxUsage,
-            kw_score:      kw.keyword_score as Number,
-            matched_kw:    kw.matched_keywords,
-            freq_count:    0,
-            _merged:       false
-        }
-    }
-
-// ── IDs already merged (to avoid adding freq-only duplicates) ──
-var mergedIds = kwEnriched map $.material_id
-
-// ── Freq-only candidates not touched by kw merge ──────────────
-var freqOnly = freqCandidates filter !(mergedIds contains $.material_id)
-
-// ── Union all candidates ───────────────────────────────────────
-var allCandidates = freqOnly ++ kwEnriched
-
-// ── Compute final score ────────────────────────────────────────
-var scored = allCandidates map (c) -> {
-    material_id:   c.material_id,
-    itemnmbr:      c.itemnmbr,
-    itemdesc:      c.itemdesc,
-    category:      c.category,
-    catalog_usage: c.catalog_usage,
-    score:         (FREQ_W * c.freq_score) +
-                   (KW_W   * c.kw_score)   +
-                   (POP_W  * c.pop_score),
-    reasons: (
-        (if (c.freq_count > 0)
-            ["Used in $(c.freq_count)/$(numSimilar) similar calls"]
-         else []) ++
-        (if (!isEmpty(c.matched_kw))
-            ["Keyword matches: $(c.matched_kw joinBy ', ')"]
-         else [])
-    )
-}
-
-// ── Sort descending, take top K ───────────────────────────────
-var topK = p('recommendation.topKResults') as Number default 15
-var ranked = (scored orderBy -$.score)[0..topK - 1]
----
-ranked]]></ee:set-payload>
-            </ee:message>
-        </ee:transform>
-
-        <!-- ── 11. Build Final Response ───────────────────────────── -->
-        <ee:transform doc:name="Build Response Payload">
-            <ee:message>
-                <ee:set-payload><![CDATA[%dw 2.0
-output application/json
-var endTimeMs   = now() as Number {unit: 'milliseconds'}
-var latencyMs   = endTimeMs - vars.startTimeMs
-var req         = vars.parsedRequest
----
-{
-    Response: {
-        Service_Call_ID: req.serviceCallId,
-        search_metadata: {
-            query_vector_source:      if (!isEmpty(req.serviceDescription)) req.serviceDescription
-                                      else if (!isEmpty(req.problemDesc)) req.problemDesc
-                                      else "combined_notes",
-            total_suggestions_found:  sizeOf(payload),
-            search_latency_ms:        latencyMs as Number
-        },
-        suggested_materials: payload map (rec) -> {
-            similarity_score: round(rec.score * 10000) / 10000,
-            material_details: {
-                material_id: rec.material_id,
-                ITEMNMBR:    rec.itemnmbr,
-                ITEMDESC:    rec.itemdesc,
-                category:    rec.category,
-                reasons:     rec.reasons
-            }
-        }
-    }
-}]]></ee:set-payload>
-            </ee:message>
+        <!-- ── Extract request fields into variables ─────────────── -->
+        <ee:transform doc:name="Extract Request Fields">
             <ee:variables>
-                <ee:set-variable variableName="httpStatus"><![CDATA[200]]></ee:set-variable>
+                <ee:set-variable variableName="serviceCallId"><![CDATA[%dw 2.0
+output application/java
+---
+trim(payload.Request.Service_Call_ID default "")]]></ee:set-variable>
+
+                <ee:set-variable variableName="serviceDescription"><![CDATA[%dw 2.0
+output application/java
+---
+trim(payload.Request.Service_Description default "")]]></ee:set-variable>
+
+                <ee:set-variable variableName="problemDesc"><![CDATA[%dw 2.0
+output application/java
+---
+trim(payload.Request.ProblemDesc default "")]]></ee:set-variable>
+
+                <ee:set-variable variableName="appNotes"><![CDATA[%dw 2.0
+output application/java
+---
+payload.Request.app_notes default []]]></ee:set-variable>
+
+                <ee:set-variable variableName="orderMaterials"><![CDATA[%dw 2.0
+output application/java
+---
+payload.Request.order_materials default []]]></ee:set-variable>
             </ee:variables>
         </ee:transform>
 
-        <!-- Set HTTP 200 OK -->
-        <http:listener doc:name="Set HTTP Status 200" doc:id="set-http-ok">
-            <!-- status code is set via the httpStatus variable above -->
-        </http:listener>
+        <!-- ── Build exclusion set (upper-cased ITEMDESC values) ─── -->
+        <ee:transform doc:name="Build Excluded Descs Set">
+            <ee:variables>
+                <ee:set-variable variableName="excludedDescs"><![CDATA[%dw 2.0
+output application/java
+var mats = vars.orderMaterials default []
+---
+mats
+  filter (m) -> (m.ITEMDESC != null and trim(m.ITEMDESC) != "")
+  map    (m) -> upper(trim(m.ITEMDESC))]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <!-- ── Build embedding query text ───────────────────────── -->
+        <ee:transform doc:name="Build Query Text for Embedding">
+            <ee:variables>
+                <ee:set-variable variableName="queryText"><![CDATA[%dw 2.0
+output application/java
+var notes = vars.appNotes default []
+var noteParts = notes
+  filter (n) -> (n.SummaryNotes != null and trim(n.SummaryNotes) != "" and n.SummaryNotes != "\u0000")
+  map    (n) -> trim(n.SummaryNotes)
+var allParts = [vars.serviceDescription, vars.problemDesc] ++ noteParts
+---
+allParts filter (p) -> (p != null and trim(p) != "") joinBy " | "]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <logger level="INFO"
+                message="#['Embedding call ' ++ vars.serviceCallId ++ ' | text[:120]=' ++ (vars.queryText[0..119] default '')]"
+                doc:name="Log Query Text"/>
+
+        <!-- ── Sub-flow: call Bedrock for embedding ──────────────── -->
+        <flow-ref name="generate-embedding-subflow" doc:name="Generate Embedding" doc:name="generate-embedding-subflow"/>
+
+        <!-- vars.embedding is now set (or null on failure) -->
+
+        <!-- ── Step 1: Direct material vector search ─────────────── -->
+        <flow-ref name="vector-search-materials-subflow" doc:name="vector-search-materials-subflow"/>
+
+        <!-- ── Step 2: Find similar historical service calls ──────── -->
+        <flow-ref name="find-similar-calls-subflow" doc:name="find-similar-calls-subflow"/>
+
+        <!-- ── Step 3: Frequency boost ───────────────────────────── -->
+        <flow-ref name="get-frequency-boost-subflow" doc:name="get-frequency-boost-subflow"/>
+
+        <!-- ── Step 4: Fetch max usage_count for normalisation ────── -->
+        <flow-ref name="get-max-usage-subflow" doc:name="get-max-usage-subflow"/>
+
+        <!-- ── Step 5: Merge signals and rank ────────────────────── -->
+        <flow-ref name="merge-and-rank-subflow" doc:name="merge-and-rank-subflow"/>
+
+        <!-- ── Build final API response ──────────────────────────── -->
+        <ee:transform doc:name="Build Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var latencyMs = (now() as Number {unit: 'milliseconds'}) - vars.startTimeMs
+var ranked    = vars.rankedMaterials default []
+var maxScore  = if (sizeOf(ranked) > 0) ranked[0].final_score else 1.0
+var MIN_SCORE = 0.10
+
+var suggested = ranked
+  map (rec) -> {
+    sim: if (maxScore > 0) (rec.final_score / maxScore) else 0,
+    rec: rec
+  }
+  filter (item) -> item.sim >= MIN_SCORE
+  map (item) -> {
+    similarity_score: round(item.sim * 10000) / 10000,
+    material_details: {
+      ITEMNMBR: item.rec.itemnmbr,
+      ITEMDESC: item.rec.itemdesc,
+      CATEGORY: item.rec.category,
+      REASONS:  item.rec.reasons default []
+    }
+  }
+---
+{
+  Response: {
+    Service_Call_ID: vars.serviceCallId,
+    search_metadata: {
+      query_vector_source:              vars.serviceDescription,
+      total_suggestions_found:          sizeOf(suggested),
+      search_latency_ms:                latencyMs as Number,
+      similar_calls_used:               sizeOf(vars.similarCallIds default []),
+      material_candidates_evaluated:    sizeOf(vars.materialCandidates default [])
+    },
+    suggested_materials: suggested
+  }
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <http:listener-response statusCode="200" doc:name="200 OK"/>
+
+        <!-- ── Error handling ─────────────────────────────────────── -->
+        <error-handler>
+            <on-error-continue type="APP:VALIDATION" doc:name="Validation Error">
+                <!-- Payload already set above; response code already set -->
+            </on-error-continue>
+
+            <on-error-continue type="DB:CONNECTIVITY" doc:name="DB Connection Error">
+                <ee:transform doc:name="DB Connection Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{error: "Database connection failed", detail: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <http:listener-response statusCode="500"/>
+                <logger level="ERROR" message="#['DB connection error: ' ++ error.description]" doc:name="Log DB Error"/>
+            </on-error-continue>
+
+            <on-error-continue type="DB:QUERY_EXECUTION" doc:name="DB Query Error">
+                <ee:transform doc:name="DB Query Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{error: "Database query failed", detail: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <http:listener-response statusCode="500"/>
+                <logger level="ERROR" message="#['DB query error: ' ++ error.description]" doc:name="Log Query Error"/>
+            </on-error-continue>
+
+            <on-error-continue type="ANY" doc:name="Unexpected Error">
+                <ee:transform doc:name="Generic Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{error: "Internal server error", detail: error.description}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+                <http:listener-response statusCode="500"/>
+                <logger level="ERROR" message="#['Unexpected error: ' ++ error.description]" doc:name="Log Unexpected Error"/>
+            </on-error-continue>
+        </error-handler>
 
     </flow>
 
+
     <!-- ═══════════════════════════════════════════════════════════════
-         VALIDATION ERROR HANDLER  (HTTP 400)
-    ═══════════════════════════════════════════════════════════════════ -->
-    <flow name="material-recommendation-error-flow" doc:name="Error Handler Flow">
+         SUB-FLOW — Generate Embedding via AWS Bedrock Titan V2
+         Sets vars.embedding (List<Float>) or null on failure
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="generate-embedding-subflow" doc:name="Generate Embedding Sub-Flow">
+
+        <!-- Build AWS SigV4-signed request body -->
+        <ee:transform doc:name="Build Bedrock Request Body">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{inputText: vars.queryText[0..8191]}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <http:request
+            config-ref="Bedrock_Request_Config"
+            method="POST"
+            path="/model/amazon.titan-embed-text-v2:0/invoke"
+            doc:name="Invoke Bedrock Titan Embeddings V2">
+            <http:headers><![CDATA[#[output application/java
+---
+{
+  "Content-Type"        : "application/json",
+  "Accept"              : "application/json",
+  "X-Amz-Access-Key-Id" : "${aws.accessKeyId}",
+  "X-Amz-Secret-Key"    : "${aws.secretAccessKey}",
+  "X-Amz-Region"        : "us-east-1"
+}]]]></http:headers>
+            <!--
+                NOTE: In production replace the header-based key passing above
+                with a proper AWS SigV4 policy (MuleSoft AWS Connector or a
+                custom SigV4 HTTP policy applied to this request config).
+            -->
+        </http:request>
+
+        <ee:transform doc:name="Extract Embedding Vector">
+            <ee:variables>
+                <ee:set-variable variableName="embedding"><![CDATA[%dw 2.0
+output application/java
+---
+payload.embedding]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <logger level="INFO"
+                message="#[if (vars.embedding != null) 'Embedding ready (' ++ sizeOf(vars.embedding) ++ ' dims)' else 'No embedding — results will be frequency-only']"
+                doc:name="Log Embedding Result"/>
+
         <error-handler>
-
-            <!-- 400 – missing / invalid request fields -->
-            <on-error-propagate
-                type="VALIDATION:NOT_NULL, VALIDATION:INVALID_VALUE"
-                logException="false"
-                doc:name="Handle Validation Error">
-                <ee:transform doc:name="Build 400 Response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    error: {
-        code:    400,
-        type:    "VALIDATION_ERROR",
-        message: error.description default "Invalid request payload"
-    }
-}]]></ee:set-payload>
-                    </ee:message>
-                    <ee:variables>
-                        <ee:set-variable variableName="httpStatus"><![CDATA[400]]></ee:set-variable>
-                    </ee:variables>
-                </ee:transform>
-            </on-error-propagate>
-
-            <!-- 500 – DB or unexpected errors -->
-            <on-error-propagate
-                type="ANY"
-                logException="true"
-                doc:name="Handle Unexpected Error">
-                <ee:transform doc:name="Build 500 Response">
-                    <ee:message>
-                        <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-    error: {
-        code:    500,
-        type:    "INTERNAL_ERROR",
-        message: "An unexpected error occurred while processing the recommendation request"
-    }
-}]]></ee:set-payload>
-                    </ee:message>
-                    <ee:variables>
-                        <ee:set-variable variableName="httpStatus"><![CDATA[500]]></ee:set-variable>
-                    </ee:variables>
-                </ee:transform>
-            </on-error-propagate>
-
+            <!-- On any HTTP / connectivity failure, log a warning and continue
+                 with vars.embedding = null (graceful degradation) -->
+            <on-error-continue type="ANY" doc:name="Bedrock Failure — Degrade Gracefully">
+                <set-variable variableName="embedding" value="#[null]" doc:name="Set Embedding Null"/>
+                <logger level="WARN" message="#['Bedrock embedding failed — continuing without embedding: ' ++ error.description]"
+                        doc:name="Log Bedrock Failure"/>
+            </on-error-continue>
         </error-handler>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SUB-FLOW — Vector Search: find top-30 material candidates
+         Uses IVFFlat index on hvac_materials.item_embedding
+         Sets vars.materialCandidates (List<Map>)
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="vector-search-materials-subflow" doc:name="Vector Search Materials Sub-Flow">
+
+        <choice doc:name="Skip if No Embedding">
+            <when expression="#[vars.embedding != null]">
+
+                <db:select config-ref="PostgreSQL_Config" doc:name="Vector Search hvac_materials">
+                    <db:sql><![CDATA[
+                        SELECT
+                            material_id::text,
+                            itemnmbr,
+                            itemdesc,
+                            item_category,
+                            usage_count,
+                            1 - (item_embedding <=> :embedding::vector) AS vector_sim
+                        FROM hvac_materials
+                        WHERE is_active = true
+                          AND item_embedding IS NOT NULL
+                        ORDER BY item_embedding <=> :embedding::vector
+                        LIMIT :topK
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        embedding : write(vars.embedding, "application/json"),
+                        topK      : 30
+                    }]]]></db:input-parameters>
+                </db:select>
+
+                <!-- Filter out already-ordered materials and attach vector_sim -->
+                <ee:transform doc:name="Filter Excluded and Build Candidates">
+                    <ee:variables>
+                        <ee:set-variable variableName="materialCandidates"><![CDATA[%dw 2.0
+output application/java
+var excluded = vars.excludedDescs default []
+---
+payload
+  filter (row) -> not (upper(trim(row.itemdesc default "")) in excluded)
+  map (row) -> {
+    material_id : row.material_id,
+    itemnmbr    : row.itemnmbr,
+    itemdesc    : row.itemdesc,
+    category    : row.item_category,
+    usage_count : (row.usage_count default 0) as Number,
+    vector_sim  : (row.vector_sim  default 0.0) as Number
+  }]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+            </when>
+            <otherwise>
+                <!-- No embedding: return empty candidates list -->
+                <set-variable variableName="materialCandidates" value="#[[]]"
+                              doc:name="Empty Candidates — No Embedding"/>
+            </otherwise>
+        </choice>
+
+        <logger level="INFO"
+                message="#['Material vector candidates: ' ++ sizeOf(vars.materialCandidates default [])]"
+                doc:name="Log Material Candidates Count"/>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SUB-FLOW — Find Similar Historical Service Calls
+         Uses IVFFlat index on service_calls_test.search_embedding
+         Sets vars.similarCallIds (List<String>)
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="find-similar-calls-subflow" doc:name="Find Similar Calls Sub-Flow">
+
+        <choice doc:name="Skip if No Embedding">
+            <when expression="#[vars.embedding != null]">
+
+                <db:select config-ref="PostgreSQL_Config" doc:name="Vector Search service_calls_test">
+                    <db:sql><![CDATA[
+                        SELECT service_call_id
+                        FROM   service_calls_test
+                        WHERE  service_call_id != :excludeId
+                          AND  search_embedding IS NOT NULL
+                        ORDER  BY search_embedding <=> :embedding::vector
+                        LIMIT  :topK
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        excludeId : vars.serviceCallId,
+                        embedding : write(vars.embedding, "application/json"),
+                        topK      : 15
+                    }]]]></db:input-parameters>
+                </db:select>
+
+                <ee:transform doc:name="Extract Similar Call IDs">
+                    <ee:variables>
+                        <ee:set-variable variableName="similarCallIds"><![CDATA[%dw 2.0
+output application/java
+---
+payload map (row) -> row.service_call_id]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+            </when>
+            <otherwise>
+                <set-variable variableName="similarCallIds" value="#[[]]"
+                              doc:name="Empty Similar Calls — No Embedding"/>
+            </otherwise>
+        </choice>
+
+        <logger level="INFO"
+                message="#['Similar calls found: ' ++ sizeOf(vars.similarCallIds default [])]"
+                doc:name="Log Similar Calls Count"/>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SUB-FLOW — Frequency Boost
+         Counts how many similar calls used each candidate material
+         Sets vars.freqBoost (Map<String, Float>)  e.g. {"uuid": 0.6}
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="get-frequency-boost-subflow" doc:name="Frequency Boost Sub-Flow">
+
+        <choice doc:name="Skip if No Candidates or Calls">
+            <when expression="#[sizeOf(vars.materialCandidates default []) > 0 and sizeOf(vars.similarCallIds default []) > 0]">
+
+                <ee:transform doc:name="Build Candidate ID List">
+                    <ee:variables>
+                        <ee:set-variable variableName="candidateIds"><![CDATA[%dw 2.0
+output application/java
+---
+(vars.materialCandidates default []) map (m) -> m.material_id]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+                <db:select config-ref="PostgreSQL_Config" doc:name="Count Material Usage in Similar Calls">
+                    <db:sql><![CDATA[
+                        SELECT material_id::text, COUNT(DISTINCT service_call_id) AS hit_count
+                        FROM   hvac_service_items_test
+                        WHERE  service_call_id = ANY(:similarCallIds)
+                          AND  material_id     = ANY(:candidateIds::uuid[])
+                        GROUP  BY material_id
+                    ]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{
+                        similarCallIds : vars.similarCallIds,
+                        candidateIds   : vars.candidateIds
+                    }]]]></db:input-parameters>
+                </db:select>
+
+                <ee:transform doc:name="Build Freq Boost Map">
+                    <ee:variables>
+                        <ee:set-variable variableName="freqBoost"><![CDATA[%dw 2.0
+output application/java
+var total = sizeOf(vars.similarCallIds default []) as Number
+---
+payload reduce ((row, acc = {}) ->
+    acc ++ {(row.material_id): (row.hit_count as Number) / total}
+)]]></ee:set-variable>
+                    </ee:variables>
+                </ee:transform>
+
+            </when>
+            <otherwise>
+                <set-variable variableName="freqBoost" value="#[{}]"
+                              doc:name="Empty Freq Boost Map"/>
+            </otherwise>
+        </choice>
+
+        <logger level="INFO"
+                message="#['Candidates with freq boost: ' ++ sizeOf(vars.freqBoost default {})]"
+                doc:name="Log Freq Boost Count"/>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SUB-FLOW — Fetch MAX(usage_count) for popularity normalisation
+         Sets vars.maxUsage (Number)
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="get-max-usage-subflow" doc:name="Get Max Usage Sub-Flow">
+
+        <db:select config-ref="PostgreSQL_Config" doc:name="SELECT MAX(usage_count)">
+            <db:sql>SELECT MAX(usage_count) AS max_usage FROM hvac_materials</db:sql>
+        </db:select>
+
+        <ee:transform doc:name="Extract Max Usage">
+            <ee:variables>
+                <ee:set-variable variableName="maxUsage"><![CDATA[%dw 2.0
+output application/java
+var raw = payload[0].max_usage default 1
+---
+if (raw == null or raw == 0) 1 else raw as Number]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         SUB-FLOW — Merge Signals and Rank
+         Combines vector_sim + freq_score + pop_score
+         Sets vars.rankedMaterials (List<Map>) sorted desc by final_score
+         ═══════════════════════════════════════════════════════════════ -->
+    <sub-flow name="merge-and-rank-subflow" doc:name="Merge and Rank Sub-Flow">
+
+        <ee:transform doc:name="Score, Sort and Cap Results">
+            <ee:variables>
+                <ee:set-variable variableName="rankedMaterials"><![CDATA[%dw 2.0
+output application/java
+
+// Weights (must mirror Python constants)
+var VECTOR_WEIGHT = 0.50
+var FREQ_WEIGHT   = 0.35
+var POP_WEIGHT    = 0.15
+var TOP_K         = 15
+
+var candidates = vars.materialCandidates default []
+var freqBoost  = vars.freqBoost          default {}
+var maxUsage   = vars.maxUsage           default 1
+var topKCalls  = sizeOf(vars.similarCallIds default [])
+---
+(candidates map (mat) -> do {
+    var mid        = mat.material_id
+    var vectorSim  = mat.vector_sim  as Number
+    var freqScore  = (freqBoost[mid] default 0.0) as Number
+    var popScore   = (mat.usage_count as Number)  / (maxUsage as Number)
+    var finalScore = (VECTOR_WEIGHT * vectorSim)
+                   + (FREQ_WEIGHT   * freqScore)
+                   + (POP_WEIGHT    * popScore)
+
+    var hitCount   = round(freqScore * topKCalls)
+    var reasons    = (
+        (if (freqScore > 0)
+            ["Used in $(hitCount)/$(topKCalls) similar calls"]
+        else [])
+        ++ ["Semantic similarity: $(vectorSim as String {format: "0.000"})"]
+    )
+    ---
+    mat ++ {
+        freq_score  : freqScore,
+        pop_score   : popScore,
+        final_score : finalScore,
+        reasons     : reasons
+    }
+})
+orderBy (item) -> (item.final_score * -1)   // descending
+take TOP_K]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+
+        <logger level="INFO"
+                message="#['Ranked results: ' ++ sizeOf(vars.rankedMaterials default [])]"
+                doc:name="Log Ranked Count"/>
+
+    </sub-flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         FLOW 2 — GET /health   (Shallow health check)
+         ═══════════════════════════════════════════════════════════════ -->
+    <flow name="health-check-flow" doc:name="Shallow Health Check">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="/health"
+            allowedMethods="GET"
+            doc:name="GET /health"/>
+
+        <set-payload value='#[output application/json --- {status: "ok"}]'
+                     doc:name="OK Response"/>
+
+        <http:listener-response statusCode="200"/>
+
+    </flow>
+
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         FLOW 3 — GET /health/deep   (Deep health check — pings DB)
+         ═══════════════════════════════════════════════════════════════ -->
+    <flow name="health-deep-check-flow" doc:name="Deep Health Check">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="/health/deep"
+            allowedMethods="GET"
+            doc:name="GET /health/deep"/>
+
+        <db:select config-ref="PostgreSQL_Config" doc:name="DB Ping">
+            <db:sql>SELECT 1</db:sql>
+        </db:select>
+
+        <set-payload value='#[output application/json --- {status: "ok", db: "connected"}]'
+                     doc:name="DB OK Response"/>
+
+        <http:listener-response statusCode="200"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="DB Unavailable">
+                <set-payload value='#[output application/json --- {status: "degraded", db: error.description}]'
+                             doc:name="DB Degraded Response"/>
+                <http:listener-response statusCode="503"/>
+            </on-error-continue>
+        </error-handler>
+
     </flow>
 
 </mule>
